@@ -10,9 +10,12 @@ let endCoord = null;
 let startMarker = null;
 let endMarker = null;
 
-// Graph Data
-let nodes = {}; // nodeId -> { lat, lon }
-let graph = {}; // nodeId -> Array of edge objects
+// Graph Data (Indexed by sequential integer 0 to N-1)
+let nodeLats = null; // Float64Array
+let nodeLons = null; // Float64Array
+let nodeOsmIds = []; // Array of strings (OSM IDs)
+let graph = []; // Array of arrays: nodeIndex -> Array of edge objects
+let graphT = []; // Array of arrays: nodeIndex -> Array of incoming edge objects for backward search
 let streetNetworkLayers = []; // Stores the 4 batched multi-polyline layers
 let pathLayers = []; // Stores final route polyline layers
 
@@ -25,82 +28,194 @@ const BBOX = {
 };
 
 // Visualizer & Animation handles
-let visualizerGroup; // LayerGroup for search progression markers
+let searchCanvasOverlay = null; // High-performance canvas visualizer overlay
 let isSearching = false;
 let animationTimeout = null;
 
-// Priority Queue implementation (Binary Min-Heap)
+// Custom Leaflet Canvas Overlay for high-performance visual search rendering
+const SearchCanvasOverlay = L.Layer.extend({
+  initialize: function(options) {
+    L.setOptions(this, options);
+    this.visitedF = [];
+    this.frontierF = [];
+    this.visitedB = [];
+    this.frontierB = [];
+  },
+  onAdd: function(map) {
+    this._map = map;
+    this._canvas = L.DomUtil.create('canvas', 'leaflet-search-canvas-layer');
+    this._canvas.style.position = 'absolute';
+    this._canvas.style.top = '0';
+    this._canvas.style.left = '0';
+    this._canvas.style.pointerEvents = 'none';
+    this._canvas.style.zIndex = '400';
+    
+    const size = this._map.getSize();
+    this._canvas.width = size.x;
+    this._canvas.height = size.y;
+    
+    map.getContainer().appendChild(this._canvas);
+    map.on('move', this._redraw, this);
+    map.on('resize', this._resize, this);
+    this._redraw();
+  },
+  onRemove: function(map) {
+    L.DomUtil.remove(this._canvas);
+    map.off('move', this._redraw, this);
+    map.off('resize', this._resize, this);
+  },
+  _resize: function() {
+    const size = this._map.getSize();
+    this._canvas.width = size.x;
+    this._canvas.height = size.y;
+    this._redraw();
+  },
+  addVisitedF: function(nodeIdx) {
+    this.visitedF.push(nodeIdx);
+  },
+  addFrontierF: function(nodeIdx) {
+    this.frontierF.push(nodeIdx);
+  },
+  addVisitedB: function(nodeIdx) {
+    this.visitedB.push(nodeIdx);
+  },
+  addFrontierB: function(nodeIdx) {
+    this.frontierB.push(nodeIdx);
+  },
+  clear: function() {
+    this.visitedF = [];
+    this.frontierF = [];
+    this.visitedB = [];
+    this.frontierB = [];
+    this._redraw();
+  },
+  _redraw: function() {
+    if (!this._map || !this._canvas) return;
+    const ctx = this._canvas.getContext('2d');
+    ctx.clearRect(0, 0, this._canvas.width, this._canvas.height);
+    
+    const bounds = this._map.getBounds();
+    const sw = bounds.getSouthWest();
+    const ne = bounds.getNorthEast();
+    
+    // Helper to draw a list of nodes
+    const drawNodes = (nodes, fillStyle, strokeStyle, radius) => {
+      ctx.fillStyle = fillStyle;
+      ctx.strokeStyle = strokeStyle;
+      ctx.lineWidth = 0.5;
+      const len = nodes.length;
+      for (let i = 0; i < len; i++) {
+        const idx = nodes[i];
+        const lat = nodeLats[idx];
+        const lon = nodeLons[idx];
+        if (lat >= sw.lat && lat <= ne.lat && lon >= sw.lng && lon <= ne.lng) {
+          const pt = this._map.latLngToContainerPoint([lat, lon]);
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, radius, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
+    };
+    
+    // Draw Forward Visited Nodes (Cyan)
+    drawNodes(this.visitedF, '#06b6d4', '#0891b2', 3.5);
+    
+    // Draw Backward Visited Nodes (Pink/Magenta)
+    drawNodes(this.visitedB, '#ec4899', '#db2777', 3.5);
+    
+    // Draw Forward Frontier Nodes (Yellow)
+    drawNodes(this.frontierF, '#fbbf24', '#d97706', 2.5);
+    
+    // Draw Backward Frontier Nodes (Rose)
+    drawNodes(this.frontierB, '#f43f5e', '#e11d48', 2.5);
+  }
+});
+
+// Priority Queue implementation (Binary Min-Heap backed by parallel arrays)
 class PriorityQueue {
   constructor() {
-    this.values = [];
+    this.elements = [];
+    this.priorities = [];
   }
   
   enqueue(element, priority) {
-    this.values.push({ element, priority });
+    this.elements.push(element);
+    this.priorities.push(priority);
     this.bubbleUp();
   }
   
   dequeue() {
-    if (this.values.length === 0) return null;
-    const min = this.values[0];
-    const end = this.values.pop();
-    if (this.values.length > 0) {
-      this.values[0] = end;
+    if (this.elements.length === 0) return null;
+    const minElement = this.elements[0];
+    const minPriority = this.priorities[0];
+    const endElement = this.elements.pop();
+    const endPriority = this.priorities.pop();
+    if (this.elements.length > 0) {
+      this.elements[0] = endElement;
+      this.priorities[0] = endPriority;
       this.sinkDown();
     }
-    return min;
+    return { element: minElement, priority: minPriority };
   }
   
   bubbleUp() {
-    let idx = this.values.length - 1;
-    const element = this.values[idx];
+    let idx = this.elements.length - 1;
+    const element = this.elements[idx];
+    const priority = this.priorities[idx];
     while (idx > 0) {
       let parentIdx = Math.floor((idx - 1) / 2);
-      let parent = this.values[parentIdx];
-      if (element.priority >= parent.priority) break;
-      this.values[parentIdx] = element;
-      this.values[idx] = parent;
+      let parentPriority = this.priorities[parentIdx];
+      if (priority >= parentPriority) break;
+      this.elements[idx] = this.elements[parentIdx];
+      this.priorities[idx] = parentPriority;
       idx = parentIdx;
     }
+    this.elements[idx] = element;
+    this.priorities[idx] = priority;
   }
   
   sinkDown() {
     let idx = 0;
-    const length = this.values.length;
-    const element = this.values[0];
+    const length = this.elements.length;
+    const element = this.elements[idx];
+    const priority = this.priorities[idx];
     while (true) {
       let leftChildIdx = 2 * idx + 1;
       let rightChildIdx = 2 * idx + 2;
-      let leftChild, rightChild;
+      let leftChildPriority, rightChildPriority;
       let swap = null;
       if (leftChildIdx < length) {
-        leftChild = this.values[leftChildIdx];
-        if (leftChild.priority < element.priority) {
+        leftChildPriority = this.priorities[leftChildIdx];
+        if (leftChildPriority < priority) {
           swap = leftChildIdx;
         }
       }
       if (rightChildIdx < length) {
-        rightChild = this.values[rightChildIdx];
+        rightChildPriority = this.priorities[rightChildIdx];
         if (
-          (swap === null && rightChild.priority < element.priority) ||
-          (swap !== null && rightChild.priority < leftChild.priority)
+          (swap === null && rightChildPriority < priority) ||
+          (swap !== null && rightChildPriority < leftChildPriority)
         ) {
           swap = rightChildIdx;
         }
       }
       if (swap === null) break;
-      this.values[idx] = this.values[swap];
-      this.values[swap] = element;
+      this.elements[idx] = this.elements[swap];
+      this.priorities[idx] = this.priorities[swap];
       idx = swap;
     }
+    this.elements[idx] = element;
+    this.priorities[idx] = priority;
   }
   
   isEmpty() {
-    return this.values.length === 0;
+    return this.elements.length === 0;
   }
   
   clear() {
-    this.values = [];
+    this.elements = [];
+    this.priorities = [];
   }
 }
 
@@ -114,6 +229,16 @@ function haversineDistance(lat1, lon1, lat2, lon2) {
             Math.sin(dLon/2) * Math.sin(dLon/2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   return R * c;
+}
+
+// Fast flat-surface approximation for A* heuristic
+// For Hanoi (average lat ~21.0275), 1 deg lat ~ 111132m, 1 deg lon ~ 103906m
+const LAT_TO_METER = 111132;
+const LON_TO_METER = 103906;
+function fastDistance(lat1, lon1, lat2, lon2) {
+  const dLat = (lat2 - lat1) * 111132;
+  const dLon = (lon2 - lon1) * 103906;
+  return Math.sqrt(dLat * dLat + dLon * dLon);
 }
 
 function calculateBearing(lat1, lon1, lat2, lon2) {
@@ -131,23 +256,23 @@ function isWithinBbox(lat, lng) {
   return lat >= BBOX.minLat && lat <= BBOX.maxLat && lng >= BBOX.minLon && lng <= BBOX.maxLon;
 }
 
-// Locate the nearest Graph Node to click/geocode coordinates (Optimized Euclidean filter)
+// Locate the nearest Graph Node to click/geocode coordinates (Optimized Euclidean filter using typed arrays)
 function findNearestNode(lat, lng) {
   let minSquaredDist = Infinity;
-  let nearestNodeId = null;
+  let nearestNodeIndex = -1;
+  if (!nodeLats) return -1;
   
-  // Fast Euclidean pre-filtering in degrees
-  for (const id in nodes) {
-    const node = nodes[id];
-    const dLat = node.lat - lat;
-    const dLng = node.lon - lng;
+  const len = nodeLats.length;
+  for (let i = 0; i < len; i++) {
+    const dLat = nodeLats[i] - lat;
+    const dLng = nodeLons[i] - lng;
     const squaredDist = dLat * dLat + dLng * dLng;
     if (squaredDist < minSquaredDist) {
       minSquaredDist = squaredDist;
-      nearestNodeId = id;
+      nearestNodeIndex = i;
     }
   }
-  return nearestNodeId;
+  return nearestNodeIndex;
 }
 
 // Initialize Leaflet Map
@@ -185,8 +310,9 @@ function initMap() {
     interactive: false
   }).addTo(map);
   
-  // Layer Groups
-  visualizerGroup = L.layerGroup().addTo(map);
+  // High-performance canvas search progress overlay
+  searchCanvasOverlay = new SearchCanvasOverlay();
+  searchCanvasOverlay.addTo(map);
   
   // Setup Map click listener
   map.on('click', handleMapClick);
@@ -299,7 +425,7 @@ function clearEndPoint() {
 
 function checkFindRouteState() {
   const btn = document.getElementById('findRouteBtn');
-  const hasGraph = Object.keys(nodes).length > 0;
+  const hasGraph = nodeLats && nodeLats.length > 0;
   btn.disabled = !(startCoord && endCoord && hasGraph);
 }
 
@@ -349,27 +475,47 @@ async function loadLocalMapData() {
   }
 }
 
-// Parse OSM JSON and build topological adjacency list
+// Parse OSM JSON and build topological adjacency list (using typed arrays and numeric indices)
 function parseOSMData(data) {
-  nodes = {};
-  graph = {};
-  
   const elements = data.elements;
   
-  // 1. Gather Nodes
-  for (const element of elements) {
+  // Temporary map to look up node index by OSM ID
+  const osmIdToIndex = new Map();
+  const tempLats = [];
+  const tempLons = [];
+  const tempOsmIds = [];
+  let nodeIndex = 0;
+  
+  // 1. Gather Nodes and assign indices
+  for (let i = 0; i < elements.length; i++) {
+    const element = elements[i];
     if (element.type === 'node') {
-      nodes[element.id] = {
-        lat: element.lat,
-        lon: element.lon
-      };
+      osmIdToIndex.set(String(element.id), nodeIndex);
+      tempLats.push(element.lat);
+      tempLons.push(element.lon);
+      tempOsmIds.push(String(element.id));
+      nodeIndex++;
     }
+  }
+  
+  // Create typed arrays for fast spatial lookup and heuristic calculation
+  nodeLats = new Float64Array(tempLats);
+  nodeLons = new Float64Array(tempLons);
+  nodeOsmIds = tempOsmIds;
+  
+  // Initialize graph and transpose graph as arrays of arrays
+  graph = new Array(nodeIndex);
+  graphT = new Array(nodeIndex);
+  for (let i = 0; i < nodeIndex; i++) {
+    graph[i] = [];
+    graphT[i] = [];
   }
   
   let edgeCount = 0;
   
   // 2. Build Adjacency list from Ways
-  for (const element of elements) {
+  for (let k = 0; k < elements.length; k++) {
+    const element = elements[k];
     if (element.type === 'way' && element.nodes) {
       const wayNodes = element.nodes;
       const tags = element.tags || {};
@@ -394,11 +540,14 @@ function parseOSMData(data) {
       }
       
       for (let i = 0; i < wayNodes.length - 1; i++) {
-        const u = String(wayNodes[i]);
-        const v = String(wayNodes[i+1]);
+        const uStr = String(wayNodes[i]);
+        const vStr = String(wayNodes[i+1]);
         
-        if (nodes[u] && nodes[v]) {
-          const dist = haversineDistance(nodes[u].lat, nodes[u].lon, nodes[v].lat, nodes[v].lon);
+        const u = osmIdToIndex.get(uStr);
+        const v = osmIdToIndex.get(vStr);
+        
+        if (u !== undefined && v !== undefined) {
+          const dist = haversineDistance(nodeLats[u], nodeLons[u], nodeLats[v], nodeLons[v]);
           
           const edgeData = {
             distance: dist,
@@ -411,18 +560,18 @@ function parseOSMData(data) {
           
           // Connect bidirectional or one-way edges
           if (!isReverse) {
-            if (!graph[u]) graph[u] = [];
             graph[u].push({ to: v, ...edgeData });
+            graphT[v].push({ to: u, ...edgeData });
             edgeCount++;
           }
           if (!isOneWay && !isReverse) {
-            if (!graph[v]) graph[v] = [];
             graph[v].push({ to: u, ...edgeData });
+            graphT[u].push({ to: v, ...edgeData });
             edgeCount++;
           }
           if (isReverse) {
-            if (!graph[v]) graph[v] = [];
             graph[v].push({ to: u, ...edgeData });
+            graphT[u].push({ to: v, ...edgeData });
             edgeCount++;
           }
         }
@@ -430,7 +579,7 @@ function parseOSMData(data) {
     }
   }
   
-  const nodeCount = Object.keys(nodes).length;
+  const nodeCount = nodeLats.length;
   
   if (nodeCount === 0) {
     showStatus("No nodes found in the map dataset.", "error");
@@ -455,22 +604,22 @@ function renderLoadedNetwork() {
   const railwayCoords = [];
   
   const seenEdges = new Set();
+  const graphLen = graph.length;
   
-  for (const u in graph) {
+  for (let u = 0; u < graphLen; u++) {
     const neighbors = graph[u];
-    const nodeU = nodes[u];
     
-    for (const edge of neighbors) {
+    for (let i = 0; i < neighbors.length; i++) {
+      const edge = neighbors[i];
       const v = edge.to;
-      const nodeV = nodes[v];
       
       const edgeKey = u < v ? `${u}-${v}` : `${v}-${u}`;
       if (seenEdges.has(edgeKey)) continue;
       seenEdges.add(edgeKey);
       
       const segment = [
-        [nodeU.lat, nodeU.lon],
-        [nodeV.lat, nodeV.lon]
+        [nodeLats[u], nodeLons[u]],
+        [nodeLats[v], nodeLons[v]]
       ];
       
       if (edge.isRailway) {
@@ -542,7 +691,7 @@ function toggleNetworkGraphVisibility() {
 
 // A* Routing Logic
 function startPathfinding() {
-  if (isSearching || !startCoord || !endCoord || Object.keys(nodes).length === 0) return;
+  if (isSearching || !startCoord || !endCoord || !nodeLats || nodeLats.length === 0) return;
   
   clearPathAndAnimations();
   isSearching = true;
@@ -554,80 +703,148 @@ function startPathfinding() {
   const startNodeId = findNearestNode(startCoord.lat, startCoord.lng);
   const endNodeId = findNearestNode(endCoord.lat, endCoord.lng);
   
-  if (!startNodeId || !endNodeId) {
+  if (startNodeId === -1 || endNodeId === -1) {
     showStatus("Could not map routing coordinates to the street network graph.", "error");
     isSearching = false;
     return;
   }
   
-  showStatus("Executing A* Pathfinding algorithm...", "loading");
+  showStatus("Executing Bidirectional A* Pathfinding...", "loading");
   
-  // A* structures
-  const gScore = {}; // Cost to node
-  const fScore = {}; // Cost + Heuristic
-  const edgeTo = {}; // Traceback paths
-  const visited = new Set();
+  const numNodes = nodeLats.length;
   
-  // Initialize
-  for (const id in nodes) {
-    gScore[id] = Infinity;
-    fScore[id] = Infinity;
-  }
+  // Bidirectional A* structures
+  const gScoreF = new Float64Array(numNodes);
+  const gScoreB = new Float64Array(numNodes);
+  gScoreF.fill(Infinity);
+  gScoreB.fill(Infinity);
   
-  const startNode = nodes[startNodeId];
-  const endNode = nodes[endNodeId];
+  const edgeToF = new Array(numNodes);
+  const edgeToB = new Array(numNodes);
   
-  gScore[startNodeId] = 0;
-  fScore[startNodeId] = haversineDistance(startNode.lat, startNode.lon, endNode.lat, endNode.lon);
+  const visitedF = new Uint8Array(numNodes);
+  const visitedB = new Uint8Array(numNodes);
+  let visitedCount = 0;
   
-  const pq = new PriorityQueue();
-  pq.enqueue(startNodeId, fScore[startNodeId]);
+  gScoreF[startNodeId] = 0;
+  gScoreB[endNodeId] = 0;
+  
+  const pqF = new PriorityQueue();
+  const pqB = new PriorityQueue();
+  
+  pqF.enqueue(startNodeId, fastDistance(nodeLats[startNodeId], nodeLons[startNodeId], nodeLats[endNodeId], nodeLons[endNodeId]));
+  pqB.enqueue(endNodeId, fastDistance(nodeLats[endNodeId], nodeLons[endNodeId], nodeLats[startNodeId], nodeLons[startNodeId]));
   
   let found = false;
+  let bestPathLength = Infinity;
+  let meetingNode = -1;
   const startTime = performance.now();
   
-  // INSTANT mode (Runs without visual A* sweeps)
+  // INSTANT mode (Runs without visual sweeps)
   if (speedSetting === "instant") {
-    while (!pq.isEmpty()) {
-      const current = pq.dequeue().element;
+    while (!pqF.isEmpty() && !pqB.isEmpty()) {
+      const minPriorityF = pqF.priorities[0];
+      const minPriorityB = pqB.priorities[0];
       
-      if (current === endNodeId) {
-        found = true;
+      // Stop condition
+      if (minPriorityF + minPriorityB >= bestPathLength) {
+        if (meetingNode !== -1) found = true;
         break;
       }
       
-      if (visited.has(current)) continue;
-      visited.add(current);
-      
-      const neighbors = graph[current] || [];
-      for (const edge of neighbors) {
-        const neighbor = edge.to;
-        if (visited.has(neighbor)) continue;
+      let current;
+      if (minPriorityF <= minPriorityB) {
+        current = pqF.dequeue().element;
+        if (visitedF[current] === 1) continue;
         
-        // Routing preference filter rules
-        if (routingPreference === "railway" && !edge.isRailway) continue;
-        if (routingPreference !== "railway" && edge.isRailway) continue;
+        if (visitedB[current] === 1) {
+          found = true;
+          break;
+        }
         
-        // Traffic penalty rules
-        const costWeight = routingPreference === "shortest" ? edge.distance : edge.weight;
-        const tentativeG = gScore[current] + costWeight;
+        visitedF[current] = 1;
+        visitedCount++;
         
-        if (tentativeG < gScore[neighbor]) {
-          gScore[neighbor] = tentativeG;
-          edgeTo[neighbor] = { from: current, edge: edge };
-          const h = haversineDistance(nodes[neighbor].lat, nodes[neighbor].lon, endNode.lat, endNode.lon);
-          fScore[neighbor] = tentativeG + h;
-          pq.enqueue(neighbor, fScore[neighbor]);
+        const neighbors = graph[current] || [];
+        const neighborsLen = neighbors.length;
+        for (let i = 0; i < neighborsLen; i++) {
+          const edge = neighbors[i];
+          const neighbor = edge.to;
+          if (visitedF[neighbor] === 1) continue;
+          
+          if (routingPreference === "railway" && !edge.isRailway) continue;
+          if (routingPreference !== "railway" && edge.isRailway) continue;
+          
+          const costWeight = routingPreference === "shortest" ? edge.distance : edge.weight;
+          const tentativeG = gScoreF[current] + costWeight;
+          
+          if (tentativeG < gScoreF[neighbor]) {
+            gScoreF[neighbor] = tentativeG;
+            edgeToF[neighbor] = { from: current, edge: edge };
+            const h = fastDistance(nodeLats[neighbor], nodeLons[neighbor], nodeLats[endNodeId], nodeLons[endNodeId]);
+            pqF.enqueue(neighbor, tentativeG + h);
+            
+            // Check meeting point
+            if (gScoreB[neighbor] < Infinity) {
+              const candidate = tentativeG + gScoreB[neighbor];
+              if (candidate < bestPathLength) {
+                bestPathLength = candidate;
+                meetingNode = neighbor;
+              }
+            }
+          }
+        }
+      } else {
+        current = pqB.dequeue().element;
+        if (visitedB[current] === 1) continue;
+        
+        if (visitedF[current] === 1) {
+          found = true;
+          break;
+        }
+        
+        visitedB[current] = 1;
+        visitedCount++;
+        
+        const neighbors = graphT[current] || [];
+        const neighborsLen = neighbors.length;
+        for (let i = 0; i < neighborsLen; i++) {
+          const edge = neighbors[i];
+          const neighbor = edge.to;
+          if (visitedB[neighbor] === 1) continue;
+          
+          if (routingPreference === "railway" && !edge.isRailway) continue;
+          if (routingPreference !== "railway" && edge.isRailway) continue;
+          
+          const costWeight = routingPreference === "shortest" ? edge.distance : edge.weight;
+          const tentativeG = gScoreB[current] + costWeight;
+          
+          if (tentativeG < gScoreB[neighbor]) {
+            gScoreB[neighbor] = tentativeG;
+            edgeToB[neighbor] = { from: current, edge: edge };
+            const h = fastDistance(nodeLats[neighbor], nodeLons[neighbor], nodeLats[startNodeId], nodeLons[startNodeId]);
+            pqB.enqueue(neighbor, tentativeG + h);
+            
+            // Check meeting point
+            if (gScoreF[neighbor] < Infinity) {
+              const candidate = gScoreF[neighbor] + tentativeG;
+              if (candidate < bestPathLength) {
+                bestPathLength = candidate;
+                meetingNode = neighbor;
+              }
+            }
+          }
         }
       }
     }
     
     isSearching = false;
     const elapsed = performance.now() - startTime;
-    console.log(`A* pathfinding solved in ${elapsed.toFixed(1)}ms`);
+    console.log(`Bidirectional A* solved in ${elapsed.toFixed(1)}ms`);
     
-    if (found) {
-      drawFinalPath(startNodeId, endNodeId, edgeTo, visited.size);
+    if (found || meetingNode !== -1) {
+      if (meetingNode === -1) meetingNode = startNodeId;
+      drawFinalPath(startNodeId, endNodeId, edgeToF, edgeToB, meetingNode, visitedCount);
     } else {
       showStatus("No route found between the selected locations.", "error");
     }
@@ -635,77 +852,142 @@ function startPathfinding() {
   } else {
     // ANIMATED mode (Slow & Detailed or Fast batches)
     const batchSize = speedSetting === "animated-fast" ? 35 : 1;
-    const intervalTime = speedSetting === "animated-fast" ? 16 : 40; // requestAnimationFrame or setTimeout
+    const intervalTime = speedSetting === "animated-fast" ? 16 : 40;
+    
+    if (searchCanvasOverlay) searchCanvasOverlay.clear();
     
     function animateStep() {
-      if (pq.isEmpty() || !isSearching) {
-        if (!found) {
+      if ((pqF.isEmpty() && pqB.isEmpty()) || !isSearching) {
+        if (!found && meetingNode === -1) {
           showStatus("No route found between the selected locations.", "error");
           isSearching = false;
         }
         return;
       }
       
+      let canvasChanged = false;
+      
       for (let i = 0; i < batchSize; i++) {
-        if (pq.isEmpty()) break;
+        if (pqF.isEmpty() && pqB.isEmpty()) break;
         
-        const current = pq.dequeue().element;
+        const minPriorityF = pqF.isEmpty() ? Infinity : pqF.priorities[0];
+        const minPriorityB = pqB.isEmpty() ? Infinity : pqB.priorities[0];
         
-        if (current === endNodeId) {
+        if (minPriorityF + minPriorityB >= bestPathLength) {
           found = true;
           isSearching = false;
-          drawFinalPath(startNodeId, endNodeId, edgeTo, visited.size);
+          if (searchCanvasOverlay) searchCanvasOverlay._redraw();
+          drawFinalPath(startNodeId, endNodeId, edgeToF, edgeToB, meetingNode, visitedCount);
           return;
         }
         
-        if (visited.has(current)) continue;
-        visited.add(current);
-        
-        // Draw visited node (Cyan CircleMarker directly on HTML5 Canvas)
-        const node = nodes[current];
-        L.circleMarker([node.lat, node.lon], {
-          radius: 3.5,
-          fillColor: '#06b6d4',
-          color: '#0891b2',
-          weight: 0.5,
-          fillOpacity: 0.75,
-          interactive: false
-        }).addTo(visualizerGroup);
-        
-        const neighbors = graph[current] || [];
-        for (const edge of neighbors) {
-          const neighbor = edge.to;
-          if (visited.has(neighbor)) continue;
+        let current;
+        if (minPriorityF <= minPriorityB) {
+          current = pqF.dequeue().element;
+          if (visitedF[current] === 1) continue;
           
-          if (routingPreference === "railway" && !edge.isRailway) continue;
-          if (routingPreference !== "railway" && edge.isRailway) continue;
+          if (visitedB[current] === 1) {
+            found = true;
+            isSearching = false;
+            if (searchCanvasOverlay) searchCanvasOverlay._redraw();
+            drawFinalPath(startNodeId, endNodeId, edgeToF, edgeToB, meetingNode !== -1 ? meetingNode : current, visitedCount);
+            return;
+          }
           
-          const costWeight = routingPreference === "shortest" ? edge.distance : edge.weight;
-          const tentativeG = gScore[current] + costWeight;
+          visitedF[current] = 1;
+          visitedCount++;
           
-          if (tentativeG < gScore[neighbor]) {
-            gScore[neighbor] = tentativeG;
-            edgeTo[neighbor] = { from: current, edge: edge };
-            const h = haversineDistance(nodes[neighbor].lat, nodes[neighbor].lon, endNode.lat, endNode.lon);
-            fScore[neighbor] = tentativeG + h;
-            pq.enqueue(neighbor, fScore[neighbor]);
+          if (searchCanvasOverlay) searchCanvasOverlay.addVisitedF(current);
+          canvasChanged = true;
+          
+          const neighbors = graph[current] || [];
+          const neighborsLen = neighbors.length;
+          for (let j = 0; j < neighborsLen; j++) {
+            const edge = neighbors[j];
+            const neighbor = edge.to;
+            if (visitedF[neighbor] === 1) continue;
             
-            // Draw frontier queue node (Yellow CircleMarker on Canvas)
-            const neighborNode = nodes[neighbor];
-            L.circleMarker([neighborNode.lat, neighborNode.lon], {
-              radius: 2.5,
-              fillColor: '#fbbf24',
-              color: '#d97706',
-              weight: 0.5,
-              fillOpacity: 0.7,
-              interactive: false
-            }).addTo(visualizerGroup);
+            if (routingPreference === "railway" && !edge.isRailway) continue;
+            if (routingPreference !== "railway" && edge.isRailway) continue;
+            
+            const costWeight = routingPreference === "shortest" ? edge.distance : edge.weight;
+            const tentativeG = gScoreF[current] + costWeight;
+            
+            if (tentativeG < gScoreF[neighbor]) {
+              gScoreF[neighbor] = tentativeG;
+              edgeToF[neighbor] = { from: current, edge: edge };
+              const h = fastDistance(nodeLats[neighbor], nodeLons[neighbor], nodeLats[endNodeId], nodeLons[endNodeId]);
+              pqF.enqueue(neighbor, tentativeG + h);
+              
+              if (searchCanvasOverlay) searchCanvasOverlay.addFrontierF(neighbor);
+              canvasChanged = true;
+              
+              if (gScoreB[neighbor] < Infinity) {
+                const candidate = tentativeG + gScoreB[neighbor];
+                if (candidate < bestPathLength) {
+                  bestPathLength = candidate;
+                  meetingNode = neighbor;
+                }
+              }
+            }
+          }
+        } else {
+          current = pqB.dequeue().element;
+          if (visitedB[current] === 1) continue;
+          
+          if (visitedF[current] === 1) {
+            found = true;
+            isSearching = false;
+            if (searchCanvasOverlay) searchCanvasOverlay._redraw();
+            drawFinalPath(startNodeId, endNodeId, edgeToF, edgeToB, meetingNode !== -1 ? meetingNode : current, visitedCount);
+            return;
+          }
+          
+          visitedB[current] = 1;
+          visitedCount++;
+          
+          if (searchCanvasOverlay) searchCanvasOverlay.addVisitedB(current);
+          canvasChanged = true;
+          
+          const neighbors = graphT[current] || [];
+          const neighborsLen = neighbors.length;
+          for (let j = 0; j < neighborsLen; j++) {
+            const edge = neighbors[j];
+            const neighbor = edge.to;
+            if (visitedB[neighbor] === 1) continue;
+            
+            if (routingPreference === "railway" && !edge.isRailway) continue;
+            if (routingPreference !== "railway" && edge.isRailway) continue;
+            
+            const costWeight = routingPreference === "shortest" ? edge.distance : edge.weight;
+            const tentativeG = gScoreB[current] + costWeight;
+            
+            if (tentativeG < gScoreB[neighbor]) {
+              gScoreB[neighbor] = tentativeG;
+              edgeToB[neighbor] = { from: current, edge: edge };
+              const h = fastDistance(nodeLats[neighbor], nodeLons[neighbor], nodeLats[startNodeId], nodeLons[startNodeId]);
+              pqB.enqueue(neighbor, tentativeG + h);
+              
+              if (searchCanvasOverlay) searchCanvasOverlay.addFrontierB(neighbor);
+              canvasChanged = true;
+              
+              if (gScoreF[neighbor] < Infinity) {
+                const candidate = gScoreF[neighbor] + tentativeG;
+                if (candidate < bestPathLength) {
+                  bestPathLength = candidate;
+                  meetingNode = neighbor;
+                }
+              }
+            }
           }
         }
       }
       
-      // Update real-time Visited stats in panel
-      document.getElementById('statVisited').textContent = visited.size + " nodes";
+      if (canvasChanged && searchCanvasOverlay) {
+        searchCanvasOverlay._redraw();
+      }
+      
+      document.getElementById('statVisited').textContent = visitedCount + " nodes";
       
       if (speedSetting === "animated-fast") {
         animationTimeout = requestAnimationFrame(animateStep);
@@ -714,33 +996,54 @@ function startPathfinding() {
       }
     }
     
-    // Begin step animation
     animateStep();
   }
 }
 
 // Backtrack from Destination and draw path + instructions
-function drawFinalPath(startNodeId, endNodeId, edgeTo, visitedCount) {
+function drawFinalPath(startNodeId, endNodeId, edgeToF, edgeToB, meetingNode, visitedCount) {
   const pathNodes = [];
   const pathEdges = [];
-  let curr = endNodeId;
   
+  // 1. Backtrack forward search: meetingNode -> startNodeId
+  let curr = meetingNode;
+  const forwardNodes = [];
+  const forwardEdges = [];
   while (curr !== startNodeId) {
-    const edgeObj = edgeTo[curr];
-    if (!edgeObj) break;
-    pathNodes.push(curr);
-    pathEdges.push(edgeObj.edge);
-    curr = edgeObj.from;
+    const parentObj = edgeToF[curr];
+    if (!parentObj) break;
+    forwardNodes.push(curr);
+    forwardEdges.push(parentObj.edge);
+    curr = parentObj.from;
   }
-  pathNodes.push(startNodeId);
+  forwardNodes.push(startNodeId);
+  forwardNodes.reverse();
+  forwardEdges.reverse();
   
-  pathNodes.reverse();
-  pathEdges.reverse();
+  // 2. Trace backward search: meetingNode -> endNodeId
+  curr = meetingNode;
+  const backwardNodes = [];
+  const backwardEdges = [];
+  while (curr !== endNodeId) {
+    const parentObj = edgeToB[curr];
+    if (!parentObj) break;
+    curr = parentObj.from;
+    backwardNodes.push(curr);
+    backwardEdges.push(parentObj.edge);
+  }
   
-  const pathCoords = pathNodes.map(id => [nodes[id].lat, nodes[id].lon]);
+  const pathNodesCombined = forwardNodes.concat(backwardNodes);
+  const pathEdgesCombined = forwardEdges.concat(backwardEdges);
+  
+  if (pathNodesCombined.length <= 1) {
+    showStatus("No route found between the selected locations.", "error");
+    return;
+  }
+  
+  const pathCoords = pathNodesCombined.map(idx => [nodeLats[idx], nodeLons[idx]]);
   
   // Wipe animated search points to clearly highlight path
-  visualizerGroup.clearLayers();
+  if (searchCanvasOverlay) searchCanvasOverlay.clear();
   
   // Glowing multi-layered path polyline
   const glowPolyline = L.polyline(pathCoords, {
@@ -768,7 +1071,7 @@ function drawFinalPath(startNodeId, endNodeId, edgeTo, visitedCount) {
   let totalDistance = 0;
   let totalTimeSeconds = 0;
   
-  for (const edge of pathEdges) {
+  for (const edge of pathEdgesCombined) {
     totalDistance += edge.distance;
     
     // Standard vehicle velocity profiles (m/s)
@@ -800,7 +1103,7 @@ function drawFinalPath(startNodeId, endNodeId, edgeTo, visitedCount) {
   document.getElementById('statsSection').classList.remove('hidden');
   
   // Generate step-by-step turn instructions
-  generateTurnByTurnDirections(pathNodes, pathEdges);
+  generateTurnByTurnDirections(pathNodesCombined, pathEdgesCombined);
 }
 
 function generateTurnByTurnDirections(pathNodes, pathEdges) {
@@ -818,7 +1121,7 @@ function generateTurnByTurnDirections(pathNodes, pathEdges) {
     
     const u = pathNodes[i];
     const v = pathNodes[i+1];
-    const bearing = calculateBearing(nodes[u].lat, nodes[u].lon, nodes[v].lat, nodes[v].lon);
+    const bearing = calculateBearing(nodeLats[u], nodeLons[u], nodeLats[v], nodeLons[v]);
     
     const isLast = i === pathEdges.length - 1;
     const nextEdge = isLast ? null : pathEdges[i+1];
@@ -880,7 +1183,7 @@ function clearPathAndAnimations() {
     animationTimeout = null;
   }
   
-  visualizerGroup.clearLayers();
+  if (searchCanvasOverlay) searchCanvasOverlay.clear();
   
   pathLayers.forEach(layer => map.removeLayer(layer));
   pathLayers = [];
