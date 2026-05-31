@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Xây dựng Graph OSM - Quận Hai Bà Trưng</title>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        #map { height: 600px; width: 100%; }
+        #status { padding: 10px; background: #d89a9a; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div id="status">Đang tải dữ liệu đường xá (Graph)...</div>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Khởi tạo bản đồ tại tọa độ trung tâm Quận Hai Bà Trưng [vĩ độ, kinh độ]
+        // Zoom mức 14 để nhìn rõ các con đường
+        const map = L.map('map').setView([21.0125, 105.8546], 14);
+        
+        // Thêm lớp bản đồ nền (TileLayer) từ OpenStreetMap
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+        // 1. KHAI BÁO CẤU TRÚC DỮ LIỆU ĐỒ THỊ (GRAPH)
+        const graph = {
+            nodes: {}, // Chứa danh sách các điểm: { 'lat_lon': {lat, lon, neighbors: []} }
+            
+            // Hàm thêm cạnh (nối 2 điểm): Lưu thông tin điểm A là hàng xóm của B và ngược lại
+            addEdge: function(node1Id, node2Id, dist) {
+                this.nodes[node1Id].neighbors.push({ id: node2Id, weight: dist });
+                this.nodes[node2Id].neighbors.push({ id: node1Id, weight: dist });
+            }
+        };
+
+        // 2. HÀM TÍNH KHOẢNG CÁCH (Công thức Haversine)
+        // Vì trái đất hình cầu, không dùng Pitago được mà phải dùng công thức này để tính km từ tọa độ
+        function getDist(lat1, lon1, lat2, lon2) {
+            const R = 6371; // Bán kính Trái đất (km)
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                      Math.sin(dLon/2) * Math.sin(dLon/2);
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        }
+
+        // 3. TRUY VẤN DỮ LIỆU TỪ OVERPASS API (Dữ liệu bản đồ thực tế)
+        // Area ID 3609421134 là mã định danh vùng của Quận Hai Bà Trưng
+        const query = `[out:json];
+            area(3609421134)->.a;
+            way["highway"~"primary|secondary|tertiary|residential"](area.a);
+            out geom;`; // "out geom" để lấy đầy đủ tọa độ của các điểm tạo nên con đường
+
+        const url = "https://overpass-api.de/api/interpreter?data=" + encodeURIComponent(query);
+
+        // Bắt đầu gọi API
+        fetch(url)
+        .then(res => res.json())
+        .then(data => {
+            document.getElementById('status').innerText = "Đang xử lý Graph...";
+            
+            // Duyệt qua từng con đường (way) nhận được từ dữ liệu bản đồ
+            data.elements.forEach(way => {
+                const nodesInWay = way.geometry; // Mảng các điểm {lat, lon} tạo thành đường này
+                
+                for (let i = 0; i < nodesInWay.length; i++) {
+                    const curr = nodesInWay[i];
+                    // Tạo ID duy nhất cho mỗi điểm bằng cách kết hợp Lat và Lon
+                    const nodeId = `${curr.lat}_${curr.lon}`; 
+
+                    // Bước A: Nếu điểm này lần đầu xuất hiện, thêm nó vào danh sách Nodes của Graph
+                    if (!graph.nodes[nodeId]) {
+                        graph.nodes[nodeId] = { lat: curr.lat, lon: curr.lon, neighbors: [] };
+                        
+                        // Vẽ một chấm xanh nhỏ tại vị trí điểm đó trên bản đồ
+                        L.circleMarker([curr.lat, curr.lon], { radius: 1, color: 'blue' }).addTo(map);
+                    }
+
+                    // Bước B: Nếu có điểm trước đó (i > 0), thì nối điểm hiện tại với điểm trước đó
+                    if (i > 0) {
+                        const prev = nodesInWay[i-1];
+                        const prevId = `${prev.lat}_${prev.lon}`;
+                        
+                        // Tính khoảng cách thực tế giữa điểm hiện tại và điểm trước đó
+                        const dist = getDist(curr.lat, curr.lon, prev.lat, prev.lon);
+                        
+                        // Lưu mối quan hệ này vào Graph (tạo cạnh nối)
+                        graph.addEdge(nodeId, prevId, dist);
+
+                        // Vẽ đường kẻ màu xanh lá trên bản đồ để trực quan hóa con đường
+                        L.polyline([[prev.lat, prev.lon], [curr.lat, curr.lon]], {
+                            color: 'green', weight: 1, opacity: 0.5
+                        }).addTo(map);
+                    }
+                }
+            });
+
+            // Hoàn tất quá trình chuyển đổi dữ liệu bản đồ thành Đồ thị toán học
+            document.getElementById('status').innerText = `Đã tạo xong Graph với ${Object.keys(graph.nodes).length} nodes!`;
+            console.log("Dữ liệu Graph thực tế (Dùng để tìm đường):", graph);
+        })
+        .catch(err => {
+            document.getElementById('status').innerText = "Lỗi tải dữ liệu.";
+            console.error(err);
+        });
+    </script>
+</body>
+</html>
