@@ -150,6 +150,7 @@ class PriorityQueue {
   dequeue() {
     if (this.elements.length === 0) return null;
     const minElement = this.elements[0];
+    const minPriority = this.priorities[0];
     const endElement = this.elements.pop();
     const endPriority = this.priorities.pop();
     if (this.elements.length > 0) {

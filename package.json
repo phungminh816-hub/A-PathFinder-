@@ -5,7 +5,7 @@
   "description": "Leaflet map with local OSM graph and Bidirectional A* pathfinding",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check My_Map/script.js"
+    "check": "node --check server.js && node --check My_Map/script.js && node tests/pathfinding-smoke.cjs"
   },
   "engines": {
     "node": ">=18"
