@@ -1,7 +1,10 @@
 /**
- * AstraMap - Premium A* Pathfinding Visualizer (Offline-first Local Graph Mode)
- * Fully optimized with Leaflet HTML5 Canvas rendering and local map_data.json.
+ * Leaflet map and Bidirectional A* pathfinding over a local OSM graph.
  */
+
+const appConfig = window.APP_CONFIG || {};
+const mapConfig = appConfig.map || {};
+const geocodingConfig = appConfig.geocoding || {};
 
 // Global App State
 let map;
@@ -13,18 +16,17 @@ let endMarker = null;
 // Graph Data (Indexed by sequential integer 0 to N-1)
 let nodeLats = null; // Float64Array
 let nodeLons = null; // Float64Array
-let nodeOsmIds = []; // Array of strings (OSM IDs)
 let graph = []; // Array of arrays: nodeIndex -> Array of edge objects
 let graphT = []; // Array of arrays: nodeIndex -> Array of incoming edge objects for backward search
 let streetNetworkLayers = []; // Stores the 4 batched multi-polyline layers
 let pathLayers = []; // Stores final route polyline layers
 
-// Bounding box of Central Hanoi map data
+// Bounding box covered by the local graph.
 const BBOX = {
-  minLat: 20.980,
-  maxLat: 21.075,
-  minLon: 105.770,
-  maxLon: 105.890
+  minLat: mapConfig.minLat ?? 20.980,
+  maxLat: mapConfig.maxLat ?? 21.075,
+  minLon: mapConfig.minLon ?? 105.770,
+  maxLon: mapConfig.maxLon ?? 105.890
 };
 
 // Visualizer & Animation handles
@@ -148,7 +150,6 @@ class PriorityQueue {
   dequeue() {
     if (this.elements.length === 0) return null;
     const minElement = this.elements[0];
-    const minPriority = this.priorities[0];
     const endElement = this.elements.pop();
     const endPriority = this.priorities.pop();
     if (this.elements.length > 0) {
@@ -213,10 +214,6 @@ class PriorityQueue {
     return this.elements.length === 0;
   }
   
-  clear() {
-    this.elements = [];
-    this.priorities = [];
-  }
 }
 
 // Distance & Bearing Calculations
@@ -233,22 +230,10 @@ function haversineDistance(lat1, lon1, lat2, lon2) {
 
 // Fast flat-surface approximation for A* heuristic
 // For Hanoi (average lat ~21.0275), 1 deg lat ~ 111132m, 1 deg lon ~ 103906m
-const LAT_TO_METER = 111132;
-const LON_TO_METER = 103906;
 function fastDistance(lat1, lon1, lat2, lon2) {
   const dLat = (lat2 - lat1) * 111132;
   const dLon = (lon2 - lon1) * 103906;
   return Math.sqrt(dLat * dLat + dLon * dLon);
-}
-
-function calculateBearing(lat1, lon1, lat2, lon2) {
-  const dLon = (lon2 - lon1) * Math.PI / 180;
-  const lat1Rad = lat1 * Math.PI / 180;
-  const lat2Rad = lat2 * Math.PI / 180;
-  const y = Math.sin(dLon) * Math.cos(lat2Rad);
-  const x = Math.cos(lat1Rad) * Math.sin(lat2Rad) - Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(dLon);
-  const brng = Math.atan2(y, x) * 180 / Math.PI;
-  return (brng + 360) % 360;
 }
 
 // Bounding box constraint check
@@ -277,35 +262,36 @@ function findNearestNode(lat, lng) {
 
 // Initialize Leaflet Map
 function initMap() {
-  // Hanoi center by default
+  const center = [mapConfig.centerLat ?? 21.028, mapConfig.centerLon ?? 105.83];
+  const defaultZoom = mapConfig.defaultZoom ?? 12;
+
   map = L.map('map', {
     preferCanvas: true,
-    zoomControl: false // Custom styled controls placed via CSS
-  }).setView([21.028, 105.83], 12);
+    zoomControl: false
+  }).setView(center, defaultZoom);
+
+  L.tileLayer(
+    mapConfig.tileUrl || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    {
+      attribution: mapConfig.tileAttribution || '&copy; OpenStreetMap contributors',
+      maxZoom: mapConfig.maxZoom ?? 19
+    }
+  ).addTo(map);
   
-  // Add CartoDB Dark Matter tile layer
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-    subdomains: 'abcd',
-    maxZoom: 20
-  }).addTo(map);
-  
-  // Add customized Zoom control on the top right
   L.control.zoom({
     position: 'topright'
   }).addTo(map);
   
-  // Highlight central Hanoi routing zone boundary
   const hanoiBboxCoords = [
     [BBOX.minLat, BBOX.minLon],
     [BBOX.maxLat, BBOX.maxLon]
   ];
   
   L.rectangle(hanoiBboxCoords, {
-    color: '#8b5cf6', // Violet neon
+    color: '#2563eb',
     weight: 2,
     dashArray: '6, 6',
-    fillColor: '#8b5cf6',
+    fillColor: '#2563eb',
     fillOpacity: 0.03,
     interactive: false
   }).addTo(map);
@@ -324,7 +310,7 @@ function handleMapClick(e) {
   const clickCoord = e.latlng;
   
   if (!isWithinBbox(clickCoord.lat, clickCoord.lng)) {
-    showStatus("Please pick a location inside the highlighted region.", "error");
+    showStatus("Hãy chọn vị trí bên trong vùng giới hạn.", "error");
     return;
   }
   
@@ -339,14 +325,14 @@ function handleMapClick(e) {
     clearPathAndAnimations();
     setStartPoint(clickCoord, "Map Coordinate");
     clearEndPoint();
-    showStatus("Start point set. Choose End point inside the highlighted zone.", "info");
+    showStatus("Đã đặt điểm đầu. Hãy chọn điểm cuối.", "info");
   }
 }
 
 // Set markers and update UI
 function setStartPoint(latlng, name) {
   if (!isWithinBbox(latlng.lat, latlng.lng)) {
-    showStatus("Start point must be inside the highlighted Hanoi region.", "error");
+    showStatus("Điểm đầu phải nằm trong vùng giới hạn.", "error");
     return false;
   }
   
@@ -375,7 +361,7 @@ function setStartPoint(latlng, name) {
 
 function setEndPoint(latlng, name) {
   if (!isWithinBbox(latlng.lat, latlng.lng)) {
-    showStatus("End point must be inside the highlighted Hanoi region.", "error");
+    showStatus("Điểm cuối phải nằm trong vùng giới hạn.", "error");
     return false;
   }
   
@@ -436,13 +422,13 @@ function showStatus(text, type = "info") {
   const statusSpinner = document.getElementById('statusSpinner');
   const statusIndicator = document.getElementById('statusIndicator');
   
-  statusBox.className = `status-box ${type}`;
+  statusBox.className = `status ${type}`;
   statusText.textContent = text;
   
   if (type === "loading") {
     statusSpinner.classList.remove('hidden');
     statusIndicator.classList.add('hidden');
-    statusBox.className = `status-box info`;
+    statusBox.className = 'status info';
   } else {
     statusSpinner.classList.add('hidden');
     statusIndicator.classList.remove('hidden');
@@ -451,19 +437,15 @@ function showStatus(text, type = "info") {
   statusBox.classList.remove('hidden');
 }
 
-function hideStatus() {
-  document.getElementById('statusBox').classList.add('hidden');
-}
-
 // Load local map dataset (no Overpass API query latency!)
 async function loadLocalMapData() {
   clearPathAndAnimations();
   clearNetworkLayers();
   
-  showStatus("Loading map_data.json from local database...", "loading");
+  showStatus("Đang tải dữ liệu đồ thị cục bộ...", "loading");
   
   try {
-    const response = await fetch('map_data.json');
+    const response = await fetch(mapConfig.dataUrl || 'map_data.json');
     if (!response.ok) throw new Error("Local map_data.json was not found.");
     
     const data = await response.json();
@@ -471,7 +453,7 @@ async function loadLocalMapData() {
     
   } catch (err) {
     console.error(err);
-    showStatus("Failed to load map data. Please verify map_data.json is inside project root.", "error");
+    showStatus("Không tải được dữ liệu đồ thị. Hãy kiểm tra MAP_DATA_URL và file map_data.json.", "error");
   }
 }
 
@@ -483,7 +465,6 @@ function parseOSMData(data) {
   const osmIdToIndex = new Map();
   const tempLats = [];
   const tempLons = [];
-  const tempOsmIds = [];
   let nodeIndex = 0;
   
   // 1. Gather Nodes and assign indices
@@ -493,7 +474,6 @@ function parseOSMData(data) {
       osmIdToIndex.set(String(element.id), nodeIndex);
       tempLats.push(element.lat);
       tempLons.push(element.lon);
-      tempOsmIds.push(String(element.id));
       nodeIndex++;
     }
   }
@@ -501,7 +481,6 @@ function parseOSMData(data) {
   // Create typed arrays for fast spatial lookup and heuristic calculation
   nodeLats = new Float64Array(tempLats);
   nodeLons = new Float64Array(tempLons);
-  nodeOsmIds = tempOsmIds;
   
   // Initialize graph and transpose graph as arrays of arrays
   graph = new Array(nodeIndex);
@@ -510,8 +489,6 @@ function parseOSMData(data) {
     graph[i] = [];
     graphT[i] = [];
   }
-  
-  let edgeCount = 0;
   
   // 2. Build Adjacency list from Ways
   for (let k = 0; k < elements.length; k++) {
@@ -562,17 +539,14 @@ function parseOSMData(data) {
           if (!isReverse) {
             graph[u].push({ to: v, ...edgeData });
             graphT[v].push({ to: u, ...edgeData });
-            edgeCount++;
           }
           if (!isOneWay && !isReverse) {
             graph[v].push({ to: u, ...edgeData });
             graphT[u].push({ to: v, ...edgeData });
-            edgeCount++;
           }
           if (isReverse) {
             graph[v].push({ to: u, ...edgeData });
             graphT[u].push({ to: v, ...edgeData });
-            edgeCount++;
           }
         }
       }
@@ -582,15 +556,15 @@ function parseOSMData(data) {
   const nodeCount = nodeLats.length;
   
   if (nodeCount === 0) {
-    showStatus("No nodes found in the map dataset.", "error");
+    showStatus("Dữ liệu bản đồ không có node nào.", "error");
     return;
   }
   
   // Render Network
   renderLoadedNetwork();
   
-  document.getElementById('statNodes').textContent = nodeCount + " nodes";
-  showStatus(`Urban Hanoi loaded. Choose Start & End points inside the highlighted region.`, "success");
+  document.getElementById('statNodes').textContent = nodeCount.toLocaleString('vi-VN');
+  showStatus("Đã tải đồ thị. Chọn điểm đầu và điểm cuối trong vùng giới hạn.", "success");
   checkFindRouteState();
 }
 
@@ -704,12 +678,12 @@ function startPathfinding() {
   const endNodeId = findNearestNode(endCoord.lat, endCoord.lng);
   
   if (startNodeId === -1 || endNodeId === -1) {
-    showStatus("Could not map routing coordinates to the street network graph.", "error");
+    showStatus("Không thể ghép tọa độ vào đồ thị đường đi.", "error");
     isSearching = false;
     return;
   }
   
-  showStatus("Executing Bidirectional A* Pathfinding...", "loading");
+  showStatus("Đang chạy Bidirectional A*...", "loading");
   
   const numNodes = nodeLats.length;
   
@@ -759,6 +733,7 @@ function startPathfinding() {
         
         if (visitedB[current] === 1) {
           found = true;
+          meetingNode = current;
           break;
         }
         
@@ -800,6 +775,7 @@ function startPathfinding() {
         
         if (visitedF[current] === 1) {
           found = true;
+          meetingNode = current;
           break;
         }
         
@@ -846,7 +822,7 @@ function startPathfinding() {
       if (meetingNode === -1) meetingNode = startNodeId;
       drawFinalPath(startNodeId, endNodeId, edgeToF, edgeToB, meetingNode, visitedCount);
     } else {
-      showStatus("No route found between the selected locations.", "error");
+      showStatus("Không tìm thấy đường giữa hai vị trí.", "error");
     }
     
   } else {
@@ -859,7 +835,7 @@ function startPathfinding() {
     function animateStep() {
       if ((pqF.isEmpty() && pqB.isEmpty()) || !isSearching) {
         if (!found && meetingNode === -1) {
-          showStatus("No route found between the selected locations.", "error");
+          showStatus("Không tìm thấy đường giữa hai vị trí.", "error");
           isSearching = false;
         }
         return;
@@ -987,7 +963,7 @@ function startPathfinding() {
         searchCanvasOverlay._redraw();
       }
       
-      document.getElementById('statVisited').textContent = visitedCount + " nodes";
+      document.getElementById('statVisited').textContent = visitedCount.toLocaleString('vi-VN');
       
       if (speedSetting === "animated-fast") {
         animationTimeout = requestAnimationFrame(animateStep);
@@ -1002,9 +978,6 @@ function startPathfinding() {
 
 // Backtrack from Destination and draw path + instructions
 function drawFinalPath(startNodeId, endNodeId, edgeToF, edgeToB, meetingNode, visitedCount) {
-  const pathNodes = [];
-  const pathEdges = [];
-  
   // 1. Backtrack forward search: meetingNode -> startNodeId
   let curr = meetingNode;
   const forwardNodes = [];
@@ -1036,7 +1009,7 @@ function drawFinalPath(startNodeId, endNodeId, edgeToF, edgeToB, meetingNode, vi
   const pathEdgesCombined = forwardEdges.concat(backwardEdges);
   
   if (pathNodesCombined.length <= 1) {
-    showStatus("No route found between the selected locations.", "error");
+    showStatus("Không tìm thấy đường giữa hai vị trí.", "error");
     return;
   }
   
@@ -1098,80 +1071,11 @@ function drawFinalPath(startNodeId, endNodeId, edgeToF, edgeToB, meetingNode, vi
   
   // Render Stats
   document.getElementById('statDistance').textContent = totalDistanceKm.toFixed(2) + " km";
-  document.getElementById('statTime').textContent = totalTimeMins + " mins";
-  document.getElementById('statVisited').textContent = visitedCount + " nodes";
+  document.getElementById('statTime').textContent = totalTimeMins + " phút";
+  document.getElementById('statVisited').textContent = visitedCount.toLocaleString('vi-VN');
   document.getElementById('statsSection').classList.remove('hidden');
   
-  // Generate step-by-step turn instructions
-  generateTurnByTurnDirections(pathNodesCombined, pathEdgesCombined);
-}
-
-function generateTurnByTurnDirections(pathNodes, pathEdges) {
-  const listEl = document.getElementById('directionsList');
-  listEl.innerHTML = '';
-  
-  const instructions = [];
-  let currentStreet = pathEdges[0].name;
-  let currentDist = 0;
-  let prevBearing = null;
-  
-  for (let i = 0; i < pathEdges.length; i++) {
-    const edge = pathEdges[i];
-    currentDist += edge.distance;
-    
-    const u = pathNodes[i];
-    const v = pathNodes[i+1];
-    const bearing = calculateBearing(nodeLats[u], nodeLons[u], nodeLats[v], nodeLons[v]);
-    
-    const isLast = i === pathEdges.length - 1;
-    const nextEdge = isLast ? null : pathEdges[i+1];
-    
-    if (nextEdge === null || nextEdge.name !== currentStreet) {
-      let turnAction = "Head along";
-      if (prevBearing !== null) {
-        const angleDiff = (bearing - prevBearing + 540) % 360 - 180;
-        if (angleDiff < -40) {
-          turnAction = "Turn left onto";
-        } else if (angleDiff > 40) {
-          turnAction = "Turn right onto";
-        } else {
-          turnAction = "Continue onto";
-        }
-      }
-      
-      const label = currentStreet === 'Unnamed Road' ? 'local street' : `<strong>${currentStreet}</strong>`;
-      instructions.push({
-        text: `${turnAction} ${label}`,
-        distance: currentDist
-      });
-      
-      currentStreet = nextEdge ? nextEdge.name : '';
-      currentDist = 0;
-    }
-    prevBearing = bearing;
-  }
-  
-  instructions.push({
-    text: "Arrive at <strong>Destination</strong>",
-    distance: 0
-  });
-  
-  instructions.forEach(ins => {
-    const li = document.createElement('li');
-    li.innerHTML = ins.text;
-    if (ins.distance > 0) {
-      const span = document.createElement('span');
-      span.className = 'dist';
-      span.textContent = ins.distance >= 1000 
-        ? `Go ${(ins.distance / 1000).toFixed(1)} km` 
-        : `Go ${Math.round(ins.distance)} meters`;
-      li.appendChild(span);
-    }
-    listEl.appendChild(li);
-  });
-  
-  document.getElementById('directionsSection').classList.remove('hidden');
-  showStatus("Route path computed!", "success");
+  showStatus("Đã tìm thấy đường đi.", "success");
 }
 
 // Reset A* animation timers and path objects
@@ -1189,8 +1093,6 @@ function clearPathAndAnimations() {
   pathLayers = [];
   
   document.getElementById('statsSection').classList.add('hidden');
-  document.getElementById('directionsSection').classList.add('hidden');
-  document.getElementById('directionsList').innerHTML = '';
 }
 
 // Full Clean Reset (Clear Map Button)
@@ -1199,17 +1101,23 @@ function resetAll() {
   clearStartPoint();
   clearEndPoint();
   
-  document.getElementById('statVisited').textContent = "0 nodes";
+  document.getElementById('statVisited').textContent = "0";
   document.getElementById('statDistance').textContent = "0.0 km";
-  document.getElementById('statTime').textContent = "0 mins";
+  document.getElementById('statTime').textContent = "0 phút";
   
-  showStatus("Ready. Choose Start & End points inside the highlighted region.", "info");
+  showStatus("Sẵn sàng. Hãy chọn điểm đầu và điểm cuối.", "info");
 }
 
 // Nominatim Geocoding Autocomplete Suggestions
 function setupAutocomplete(inputId, dropdownId, setCoordCallback) {
   const input = document.getElementById(inputId);
   const dropdown = document.getElementById(dropdownId);
+
+  if (geocodingConfig.enabled === false) {
+    input.placeholder = "Bấm trên bản đồ để chọn điểm";
+    input.disabled = true;
+    return;
+  }
   
   const queryNominatim = debounce(async (text) => {
     if (text.length < 3) {
@@ -1219,8 +1127,14 @@ function setupAutocomplete(inputId, dropdownId, setCoordCallback) {
     }
     
     try {
-      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(text)}&limit=5`;
-      const res = await fetch(url);
+      const url = new URL(geocodingConfig.url || 'https://nominatim.openstreetmap.org/search');
+      url.searchParams.set('format', 'jsonv2');
+      url.searchParams.set('q', text);
+      url.searchParams.set('limit', String(geocodingConfig.limit || 5));
+      url.searchParams.set('accept-language', geocodingConfig.language || 'vi');
+      url.searchParams.set('viewbox', `${BBOX.minLon},${BBOX.maxLat},${BBOX.maxLon},${BBOX.minLat}`);
+      url.searchParams.set('bounded', '1');
+      const res = await fetch(url.toString());
       if (!res.ok) return;
       const data = await res.json();
       
@@ -1228,7 +1142,7 @@ function setupAutocomplete(inputId, dropdownId, setCoordCallback) {
     } catch (err) {
       console.error("Nominatim search error: ", err);
     }
-  }, 350);
+  }, geocodingConfig.debounceMs || 1000);
   
   function renderSuggestions(items) {
     dropdown.innerHTML = '';
@@ -1245,7 +1159,11 @@ function setupAutocomplete(inputId, dropdownId, setCoordCallback) {
       const title = nameParts[0];
       const details = nameParts.slice(1).join(',').trim();
       
-      div.innerHTML = `<div><strong>${title}</strong><br><small style="color:var(--text-muted); font-size:11px">${details}</small></div>`;
+      const titleElement = document.createElement('strong');
+      const detailsElement = document.createElement('small');
+      titleElement.textContent = title;
+      detailsElement.textContent = details;
+      div.append(titleElement, document.createElement('br'), detailsElement);
       
       div.addEventListener('click', () => {
         const latlng = L.latLng(parseFloat(item.lat), parseFloat(item.lon));
@@ -1256,7 +1174,7 @@ function setupAutocomplete(inputId, dropdownId, setCoordCallback) {
           dropdown.innerHTML = '';
           dropdown.classList.add('hidden');
         } else {
-          showStatus(`"${title}" is outside Central Hanoi. Please choose a nearby address within the highlighted region.`, "error");
+          showStatus(`"${title}" nằm ngoài vùng dữ liệu. Hãy chọn một địa chỉ khác.`, "error");
         }
       });
       

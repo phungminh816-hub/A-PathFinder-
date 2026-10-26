@@ -1,0 +1,13 @@
+{
+  "name": "astar-map-pathfinder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Leaflet map with local OSM graph and Bidirectional A* pathfinding",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check My_Map/script.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

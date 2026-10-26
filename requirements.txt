@@ -1,0 +1,2 @@
+# Dự án không dùng Python và không có Python package cần cài đặt.
+# Runtime duy nhất là Node.js >= 18; xem package.json và SYSTEM_REQUIREMENTS.md.

@@ -1,164 +1,100 @@
-<!DOCTYPE html>
-<html lang="en">
-
+<!doctype html>
+<html lang="vi">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AstraMap - Premium A* Pathfinding Visualizer</title>
-  <meta name="description"
-    content="An interactive web application visualizing the A* pathfinding algorithm on real-world OpenStreetMap data with Nominatim geocoding and Overpass API network graphing.">
-
-  <!-- Leaflet CSS -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
-
-  <!-- Font Stylesheet (Outfit & Inter) -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A* Map Pathfinder</title>
+  <meta name="description" content="Tìm đường trên dữ liệu OpenStreetMap cục bộ bằng Bidirectional A*.">
   <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap"
-    rel="stylesheet">
-
-  <!-- App Stylesheet -->
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  >
   <link rel="stylesheet" href="style.css">
 </head>
-
 <body>
-  <div class="app-container">
-    <!-- Sidebar Control Panel -->
-    <aside class="sidebar">
-      <header class="sidebar-header">
-        <div class="logo">
-          <span class="logo-icon">✦</span>
-          <h1>AstraMap</h1>
+  <main class="app-shell">
+    <div id="map" aria-label="Bản đồ tìm đường"></div>
+
+    <section class="control-panel" aria-label="Điều khiển tìm đường">
+      <h1>Tìm đường A*</h1>
+
+      <div class="search-field">
+        <label for="startSearch">Điểm bắt đầu</label>
+        <div class="input-row">
+          <input id="startSearch" type="search" placeholder="Nhập địa chỉ hoặc bấm trên bản đồ" autocomplete="off">
+          <button id="clearStart" class="icon-button" type="button" title="Xóa điểm bắt đầu">×</button>
         </div>
-        <p class="subtitle">A* OSM Pathfinder & Visualizer</p>
-      </header>
+        <div id="startSuggestions" class="suggestions hidden"></div>
+      </div>
 
-      <section class="controls-section">
-        <!-- Search Inputs -->
-
-        <div class="search-group">
-          <label for="startSearch">Start Location</label>
-          <div class="search-input-wrapper">
-            <span class="input-icon start-icon">🟢</span>
-            <input type="text" id="startSearch" placeholder="Search start address or click map..." autocomplete="off">
-            <button id="clearStart" class="clear-btn" title="Clear start point">×</button>
-          </div>
-          <div id="startSuggestions" class="suggestions-dropdown hidden"></div>
+      <div class="search-field">
+        <label for="endSearch">Điểm kết thúc</label>
+        <div class="input-row">
+          <input id="endSearch" type="search" placeholder="Nhập địa chỉ hoặc bấm trên bản đồ" autocomplete="off">
+          <button id="clearEnd" class="icon-button" type="button" title="Xóa điểm kết thúc">×</button>
         </div>
+        <div id="endSuggestions" class="suggestions hidden"></div>
+      </div>
 
-        <div class="search-group">
-          <label for="endSearch">End Location</label>
-          <div class="search-input-wrapper">
-            <span class="input-icon end-icon">🔴</span>
-            <input type="text" id="endSearch" placeholder="Search end address or click map..." autocomplete="off">
-            <button id="clearEnd" class="clear-btn" title="Clear end point">×</button>
-          </div>
-          <div id="endSuggestions" class="suggestions-dropdown hidden"></div>
-        </div>
-
-        <!-- Action Buttons -->
-        <div class="action-buttons">
-          <button id="findRouteBtn" class="btn btn-primary" disabled>Find Route</button>
-          <button id="clearAllBtn" class="btn btn-secondary">Clear Map</button>
-        </div>
-      </section>
-
-      <section class="settings-section">
-        <h3>Routing Settings</h3>
-
-        <div class="setting-row">
-          <label for="routingPreference">Routing Mode</label>
+      <div class="options-grid">
+        <label>
+          Tiêu chí
           <select id="routingPreference">
-            <option value="shortest">Shortest Path (Normal edges)</option>
-            <option value="traffic">Traffic-Aware (Fastest Time)</option>
-            <option value="railway">Railway Tracking Only</option>
+            <option value="shortest">Ngắn nhất</option>
+            <option value="traffic">Theo trọng số giao thông</option>
+            <option value="railway">Chỉ đường sắt</option>
           </select>
-        </div>
-
-        <div class="setting-row">
-          <label for="searchSpeed">A* Search Speed</label>
+        </label>
+        <label>
+          Hiển thị thuật toán
           <select id="searchSpeed">
-            <option value="instant">Instant Execution</option>
-            <option value="animated-fast" selected>Animated (Fast)</option>
-            <option value="animated-slow">Animated (Detailed)</option>
+            <option value="instant">Tức thời</option>
+            <option value="animated-fast" selected>Nhanh</option>
+            <option value="animated-slow">Từng bước</option>
           </select>
-        </div>
-
-        <div class="setting-row toggle-row">
-          <label for="toggleGraph">Show Network Graph</label>
-          <div class="toggle-switch-container">
-            <input type="checkbox" id="toggleGraph" class="toggle-checkbox" checked>
-            <label for="toggleGraph" class="toggle-label-switch"></label>
-          </div>
-        </div>
-      </section>
-
-      <!-- Status Info / Loader -->
-      <div id="statusBox" class="status-box info hidden">
-        <span class="status-spinner hidden" id="statusSpinner"></span>
-        <span class="status-indicator" id="statusIndicator"></span>
-        <span id="statusText">Ready</span>
+        </label>
       </div>
 
-      <!-- Stats Panel -->
-      <section id="statsSection" class="stats-section hidden">
-        <h3>Route Summary</h3>
-        <div class="stats-grid">
-          <div class="stat-card">
-            <span class="stat-label">Total Distance</span>
-            <span id="statDistance" class="stat-value">0.0 km</span>
-          </div>
-          <div class="stat-card">
-            <span class="stat-label">Est. Travel Time</span>
-            <span id="statTime" class="stat-value">0 mins</span>
-          </div>
-          <div class="stat-card">
-            <span class="stat-label">Graph Size</span>
-            <span id="statNodes" class="stat-value">0 nodes</span>
-          </div>
-          <div class="stat-card">
-            <span class="stat-label">A* Visited</span>
-            <span id="statVisited" class="stat-value">0 nodes</span>
-          </div>
-        </div>
+      <label class="check-row">
+        <input id="toggleGraph" type="checkbox" checked>
+        Hiện đồ thị đường đi
+      </label>
 
-        <div class="legend">
-          <h4>Map Legend</h4>
-          <div class="legend-item"><span class="legend-color normal"></span><span>Normal Highway</span></div>
-          <div class="legend-item"><span class="legend-color medium"></span><span>Moderate Traffic (2.5x weight)</span>
-          </div>
-          <div class="legend-item"><span class="legend-color heavy"></span><span>Heavy Traffic (5x weight)</span></div>
-          <div class="legend-item"><span class="legend-color railway"></span><span>Railway Line (Dashed)</span></div>
-        </div>
-      </section>
-
-      <!-- Directions Panel -->
-      <section id="directionsSection" class="directions-section hidden">
-        <h3>Step-by-Step Directions</h3>
-        <div class="directions-wrapper">
-          <ol id="directionsList" class="directions-list"></ol>
-        </div>
-      </section>
-    </aside>
-
-    <!-- Map Area -->
-    <main class="map-wrapper">
-      <div id="map"></div>
-      <div class="map-overlay-instructions">
-        💡 <strong>Hint:</strong> Left-click anywhere on the map to set 🟢 Start, then click elsewhere to set 🔴 End.
-        You can also search above!
+      <div class="button-row">
+        <button id="findRouteBtn" class="primary" type="button" disabled>Tìm đường</button>
+        <button id="clearAllBtn" type="button">Đặt lại</button>
       </div>
-    </main>
-  </div>
 
-  <!-- Leaflet JS -->
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+      <div id="statusBox" class="status info">
+        <span id="statusSpinner" class="spinner hidden" aria-hidden="true"></span>
+        <span id="statusIndicator" class="status-dot" aria-hidden="true"></span>
+        <span id="statusText">Đang khởi tạo...</span>
+      </div>
 
-  <!-- App JS Logic -->
+      <dl id="statsSection" class="stats hidden">
+        <div><dt>Quãng đường</dt><dd id="statDistance">0 km</dd></div>
+        <div><dt>Thời gian ước tính</dt><dd id="statTime">0 phút</dd></div>
+        <div><dt>Số đỉnh đồ thị</dt><dd id="statNodes">0</dd></div>
+        <div><dt>Số đỉnh đã duyệt</dt><dd id="statVisited">0</dd></div>
+      </dl>
+
+      <div class="legend" aria-label="Chú thích">
+        <span><i class="normal"></i>Đường thường</span>
+        <span><i class="medium"></i>Trọng số 2.5×</span>
+        <span><i class="heavy"></i>Trọng số 5×</span>
+        <span><i class="route"></i>Kết quả</span>
+      </div>
+    </section>
+  </main>
+
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <script src="config.js"></script>
   <script src="script.js"></script>
 </body>
-
 </html>
